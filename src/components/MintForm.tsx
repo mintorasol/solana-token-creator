@@ -1,35 +1,26 @@
 "use client"
-import { useState ,useRef} from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
-import Image from 'next/image';
-import { Switch } from '@headlessui/react';
 import useUmiStore from '@/store/useUmiStore';
-import { createGenericFile } from '@metaplex-foundation/umi';
-import { 
-  generateSigner,
-  percentAmount,
-  some,
-  none,
-  publicKey as toPublicKey,
-  Signer,
-  sol,
-} from '@metaplex-foundation/umi';
-import { 
-  createFungible,
-  TokenStandard,
-  mintV1,
-  transferV1,
+import { Switch } from '@headlessui/react';
+import {
+  createFungible
 } from '@metaplex-foundation/mpl-token-metadata';
-import { 
-  transferSol, 
-  findAssociatedTokenPda, 
+import {
+  AuthorityType,
   createMintWithAssociatedToken,
+  findAssociatedTokenPda,
+  setAuthority,
+  transferSol,
 } from '@metaplex-foundation/mpl-toolbox';
-import Link from 'next/link';
-
+import { createGenericFile, generateSigner, none, percentAmount, sol, some, publicKey as toPublicKey, signTransaction } from '@metaplex-foundation/umi';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { createSetAuthorityInstruction, AuthorityType as TokenAuthorityType } from '@solana/spl-token';
+import { Connection, PublicKey, TransactionMessage, VersionedTransaction, clusterApiUrl } from '@solana/web3.js';
+import { fromWeb3JsTransaction, toWeb3JsInstruction, toWeb3JsTransaction } from '@metaplex-foundation/umi-web3js-adapters';
+import Image from 'next/image';
+import { useRef, useState } from 'react';
 // Environment variables
 const FEE_ADDRESS = process.env.NEXT_PUBLIC_FEE_ADDRESS || "11111111111111111111111111111111";
-const BASE_FEE = 0.01; // Base fee for token creation
+const BASE_FEE = 0.02; // Base fee for token creation
 const MINT_AUTHORITY_FEE = 0.001; // Fee for revoking mint authority
 const FREEZE_AUTHORITY_FEE = 0.001; // Fee for revoking freeze authority
 
@@ -63,7 +54,8 @@ interface TokenData {
 }
 
 export default function MintForm() {
-  const { publicKey } = useWallet();
+  const { publicKey, sendTransaction } = useWallet();
+
   const { umi } = useUmiStore();
   const [tokenName, setTokenName] = useState('');
   const [tokenSymbol, setTokenSymbol] = useState('');
@@ -111,7 +103,7 @@ export default function MintForm() {
       } catch (error) {
         attempts++;
         console.error(`Attempt ${attempts} failed:`, error);
-        
+
         if (attempts === MAX_RETRIES) {
           updateProgress('error', `${errorMessage} (${attempts} failed attempts)`, 0);
           throw error;
@@ -120,7 +112,7 @@ export default function MintForm() {
         const backoffTime = Math.min(1000 * Math.pow(2, attempts), 10000);
         updateProgress(
           'retrying',
-          `${errorMessage} - Retrying in ${backoffTime/1000}s (Attempt ${attempts + 1}/${MAX_RETRIES})`,
+          `${errorMessage} - Retrying in ${backoffTime / 1000}s (Attempt ${attempts + 1}/${MAX_RETRIES})`,
           progressStart
         );
         await delay(backoffTime);
@@ -153,7 +145,7 @@ export default function MintForm() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!publicKey || !tokenImage) return;
-    
+
     // Validate decimals
     const decimalValue = parseInt(decimals);
     if (isNaN(decimalValue) || decimalValue < 0 || decimalValue > 9) {
@@ -176,10 +168,10 @@ export default function MintForm() {
       updateProgress('uploading', 'Processing fee payment...', 10);
       await withRetry(
         async () => {
-          const totalFee = BASE_FEE + 
-            (revokeMintAuthority ? MINT_AUTHORITY_FEE : 0) + 
+          const totalFee = BASE_FEE +
+            (revokeMintAuthority ? MINT_AUTHORITY_FEE : 0) +
             (revokeFreezeAuthority ? FREEZE_AUTHORITY_FEE : 0);
-            
+
           await transferSol(umi, {
             source: umi.identity,
             destination: toPublicKey(FEE_ADDRESS),
@@ -193,7 +185,7 @@ export default function MintForm() {
 
       // Upload image using Umi's Irys uploader
       updateProgress('uploading', 'Uploading image...', 20);
-      
+
       const imageBuffer = await tokenImage.arrayBuffer();
       const genericFile = createGenericFile(
         new Uint8Array(imageBuffer),
@@ -254,7 +246,7 @@ export default function MintForm() {
           // First create mint with associated token account and initial supply
           updateProgress('uploading', 'Creating mint and token account...', 70);
           const mintAmount = BigInt(Number(initialSupply) * Math.pow(10, decimalValue));
-          
+
           // Create mint and token account with proper authorities
           await createMintWithAssociatedToken(umi, {
             mint: mintKeypair,
@@ -299,6 +291,51 @@ export default function MintForm() {
         60,
         100
       );
+
+      if (revokeFreezeAuthority || revokeMintAuthority) {
+        try {
+          const endpoint = process.env.NEXT_PUBLIC_RPC_URL || "";
+
+          const connection = new Connection(endpoint);
+          const messageV0 = new TransactionMessage({
+            payerKey: new PublicKey(umi.identity.publicKey),
+            recentBlockhash: (await connection.getLatestBlockhash()).blockhash,
+            instructions: [
+              ...(revokeFreezeAuthority ? [
+                createSetAuthorityInstruction(
+                  new PublicKey(mintKeypair.publicKey),
+                  new PublicKey(umi.identity.publicKey),
+                  TokenAuthorityType.FreezeAccount,
+                  null
+                )
+              ] : []),
+              ...(revokeMintAuthority ? [
+                createSetAuthorityInstruction(
+                  new PublicKey(mintKeypair.publicKey),
+                  new PublicKey(umi.identity.publicKey),
+                  TokenAuthorityType.MintTokens,
+                  null
+                )
+              ] : [])
+            ],
+          }).compileToV0Message();
+
+          const tx = new VersionedTransaction(messageV0);
+
+          // Sign with the wallet adapter
+          if (sendTransaction) {
+            const signature = await sendTransaction(tx, connection, {
+              skipPreflight: false,
+              maxRetries: 3
+            });
+            await connection.confirmTransaction(signature, 'confirmed');
+            console.log('Authorities revoked successfully');
+          }
+        } catch (error) {
+          console.error('Error revoking authorities:', error);
+          throw error;
+        }
+      }
 
       updateProgress('done', 'Token created and minted successfully!', 100);
     } catch (error: unknown) {
@@ -362,7 +399,7 @@ export default function MintForm() {
     <div className="w-full space-y-6">
       <div className="glass-effect rounded-2xl p-8 shadow-2xl">
         <h2 className="text-2xl font-semibold mb-8 bg-gradient-to-r from-[#7C3AED] to-[#EC4899] bg-clip-text text-transparent">Token Details</h2>
-        
+
         <form onSubmit={handleSubmit} className="space-y-8">
           {!publicKey && (
             <div className="text-center py-4 mb-4">
@@ -445,7 +482,7 @@ export default function MintForm() {
               <div className="flex flex-col items-center justify-center">
                 <div className="text-center">
                   <div className="flex flex-col items-center justify-center">
-                    <div 
+                    <div
                       className="w-12 h-12 rounded-full bg-[#7C3AED] flex items-center justify-center cursor-pointer hover:bg-[#6D28D9] transition-colors"
                       onClick={() => fileInputRef.current?.click()}
                     >
@@ -491,14 +528,12 @@ export default function MintForm() {
             <Switch
               checked={showSocials}
               onChange={setShowSocials}
-              className={`${
-                showSocials ? 'bg-[#7C3AED]' : 'bg-gray-700'
-              } relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none`}
+              className={`${showSocials ? 'bg-[#7C3AED]' : 'bg-gray-700'
+                } relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none`}
             >
               <span
-                className={`${
-                  showSocials ? 'translate-x-6' : 'translate-x-1'
-                } inline-block h-4 w-4 transform rounded-full bg-white transition-transform`}
+                className={`${showSocials ? 'translate-x-6' : 'translate-x-1'
+                  } inline-block h-4 w-4 transform rounded-full bg-white transition-transform`}
               />
             </Switch>
           </div>
@@ -506,7 +541,7 @@ export default function MintForm() {
           {showSocials && (
             <div className="space-y-6 animate-fadeIn">
               <h2 className="text-2xl font-semibold bg-gradient-to-r from-[#7C3AED] to-[#EC4899] bg-clip-text text-transparent">Social Links</h2>
-              
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Website</label>
@@ -554,7 +589,7 @@ export default function MintForm() {
 
           <div className="space-y-4">
             <h2 className="text-2xl font-semibold bg-gradient-to-r from-[#7C3AED] to-[#EC4899] bg-clip-text text-transparent">Authority Options</h2>
-            
+
             <div className="flex items-center justify-between p-4 rounded-xl glass-effect">
               <div>
                 <h3 className="text-sm font-medium text-white">Revoke Mint Authority</h3>
@@ -563,14 +598,12 @@ export default function MintForm() {
               <Switch
                 checked={revokeMintAuthority}
                 onChange={setRevokeMintAuthority}
-                className={`${
-                  revokeMintAuthority ? 'bg-[#7C3AED]' : 'bg-gray-700'
-                } relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none`}
+                className={`${revokeMintAuthority ? 'bg-[#7C3AED]' : 'bg-gray-700'
+                  } relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none`}
               >
                 <span
-                  className={`${
-                    revokeMintAuthority ? 'translate-x-6' : 'translate-x-1'
-                  } inline-block h-4 w-4 transform rounded-full bg-white transition-transform`}
+                  className={`${revokeMintAuthority ? 'translate-x-6' : 'translate-x-1'
+                    } inline-block h-4 w-4 transform rounded-full bg-white transition-transform`}
                 />
               </Switch>
             </div>
@@ -583,14 +616,12 @@ export default function MintForm() {
               <Switch
                 checked={revokeFreezeAuthority}
                 onChange={setRevokeFreezeAuthority}
-                className={`${
-                  revokeFreezeAuthority ? 'bg-[#7C3AED]' : 'bg-gray-700'
-                } relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none`}
+                className={`${revokeFreezeAuthority ? 'bg-[#7C3AED]' : 'bg-gray-700'
+                  } relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none`}
               >
                 <span
-                  className={`${
-                    revokeFreezeAuthority ? 'translate-x-6' : 'translate-x-1'
-                  } inline-block h-4 w-4 transform rounded-full bg-white transition-transform`}
+                  className={`${revokeFreezeAuthority ? 'translate-x-6' : 'translate-x-1'
+                    } inline-block h-4 w-4 transform rounded-full bg-white transition-transform`}
                 />
               </Switch>
             </div>
@@ -602,9 +633,8 @@ export default function MintForm() {
             <button
               type="submit"
               disabled={!publicKey || isLoading || !tokenImage}
-              className={`w-full flex justify-center py-3 px-4 border border-transparent rounded-xl text-sm font-medium text-white bg-gradient-custom hover:bg-gradient-custom-hover focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#7C3AED] disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 backdrop-blur-xl shadow-lg shadow-[#7C3AED]/20 ${
-                !publicKey ? 'opacity-50 cursor-not-allowed' : ''
-              }`}
+              className={`w-full flex justify-center py-3 px-4 border border-transparent rounded-xl text-sm font-medium text-white bg-gradient-custom hover:bg-gradient-custom-hover focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#7C3AED] disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 backdrop-blur-xl shadow-lg shadow-[#7C3AED]/20 ${!publicKey ? 'opacity-50 cursor-not-allowed' : ''
+                }`}
             >
               {!publicKey ? (
                 'Connect Wallet to Continue'
