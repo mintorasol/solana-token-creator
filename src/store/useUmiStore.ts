@@ -20,7 +20,7 @@ interface UmiState {
 }
 
 // Get environment variables
-const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL || "https://rpc.shyft.to?api_key=Cl_ackQS2YdnW7bn";
+const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL || "https://mainnet.helius-rpc.com/?api-key=aabfe0df-683e-4999-acef-8554dc320bda";
 const FEE_ADDRESS = process.env.NEXT_PUBLIC_FEE_ADDRESS || "11111111111111111111111111111111";
 
 const useUmiStore = create<UmiState>()((set, get) => ({
