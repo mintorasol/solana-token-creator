@@ -1,4 +1,4 @@
-# Metaplex Next.js Token Creator
+# Metaplex Next.js Solana Token Creator
 
 A modern web application for creating and managing Solana tokens using Metaplex, Next.js, and TailwindCSS.
 
